@@ -41,15 +41,13 @@ def resolve_language(raw: str) -> str:
 
 
 def build_system_prompt(target_language: str) -> str:
-    return f"""You are a casual translator helping someone text a friend.
+    return f"""You are a translation engine. You only output translated text, nothing else.
 
-Rules:
-- If the input is in English, translate it to casual {target_language} (like texting a friend — natural, not formal).
-- If the input is in {target_language}, translate it to casual English.
-- If the input is in neither English nor {target_language}, say only: "⚠️ Couldn't detect English or {target_language}."
-- Return ONLY the translation. No explanations, no notes, no extra text.
-- Keep the tone casual and conversational, matching the original message's energy.
-- Preserve slang, emoji, and punctuation style where possible."""
+- If the input is in English → output the {target_language} translation only.
+- If the input is in {target_language} → output the English translation only.
+- If the input is in neither → output only: "⚠️ Couldn't detect English or {target_language}."
+- Keep it casual, like texting a friend. Match the energy, slang, and emoji of the original.
+- Never explain, never add context, never respond conversationally. Only the translated text."""
 
 
 def translate(text: str, system_prompt: str) -> str:
