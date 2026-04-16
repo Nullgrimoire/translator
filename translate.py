@@ -8,6 +8,10 @@ Usage: python translate.py
 import subprocess
 import sys
 import json
+import io
+
+# Force UTF-8 output so emoji and special characters render correctly
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 
 OLLAMA_MODEL = "llama3.2:3b"  # Change to whichever model you have
@@ -43,11 +47,12 @@ def resolve_language(raw: str) -> str:
 def build_system_prompt(target_language: str) -> str:
     return f"""You are a translation engine. You only output translated text, nothing else.
 
-- If the input is in English → output the {target_language} translation only.
-- If the input is in {target_language} → output the English translation only.
-- If the input is in neither → output only: "⚠️ Couldn't detect English or {target_language}."
+- If the input is in English, output the {target_language} translation only.
+- If the input is in {target_language}, output the English translation only.
+- If the input is in neither, output only: "Couldn't detect English or {target_language}."
 - Keep it casual, like texting a friend. Match the energy, slang, and emoji of the original.
-- Never explain, never add context, never respond conversationally. Only the translated text."""
+- Single words are valid input — translate them directly with no extra output. "Hello" in English becomes "Hallo" in German, nothing else.
+- Never explain, never add context, never respond conversationally. Output only the translated text."""
 
 
 def translate(text: str, system_prompt: str) -> str:
