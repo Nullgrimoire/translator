@@ -9,6 +9,7 @@ import subprocess
 import sys
 import json
 import re
+import shutil
 
 # Windows: set console to UTF-8 so accented chars and foreign scripts render correctly
 if sys.platform == "win32":
@@ -47,6 +48,19 @@ LANGUAGE_ALIASES = {
 }
 
 DEFAULT_LANGUAGE = "Spanish"
+USE_EXACT_SINGLE_WORD_OVERRIDES = False
+
+EXACT_SINGLE_WORD_OVERRIDES = {
+    "german": {
+        "en_to_target": {
+            "hello": "Hallo",
+            "hi": "Hallo",
+        },
+        "target_to_en": {
+            "hallo": "Hello",
+        },
+    }
+}
 
 
 def resolve_language(raw: str) -> str:
@@ -55,14 +69,12 @@ def resolve_language(raw: str) -> str:
     return LANGUAGE_ALIASES.get(key, raw.strip().title())
 
 
-def build_system_prompt(target_language: str) -> str:
-    return f"""You are a translation engine. You only output translated text, nothing else.
+def build_translation_prompt(target_language: str, source_language: str, destination_language: str) -> str:
+    return f"""You are a translation engine.
 
-- If the input is in English, output the {target_language} translation only.
-- If the input is in {target_language}, output the English translation only.
-- If the input is in neither, output only: "Couldn't detect English or {target_language}."
+- Translate from {source_language} to {destination_language} only.
 - Keep it casual, like texting a friend. Match the energy, slang, and emoji of the original.
-- Single words are valid input — translate them directly with no extra output. "Hello" in English becomes "Hallo" in German, nothing else.
+- Single words are valid input. Keep output short and natural for texting.
 - Output exactly one line. Do not add labels like "Translation:" or quote marks.
 - Never explain, never add context, never respond conversationally. Output only the translated text."""
 
@@ -80,16 +92,83 @@ def sanitize_translation(text: str) -> str:
     return cleaned.strip()
 
 
-def translate(text: str, system_prompt: str) -> str:
+def has_emoji(text: str) -> bool:
+    """Basic emoji detector for common Unicode emoji blocks."""
+    return bool(re.search(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", text))
+
+
+def normalize_short_translation(source_text: str, translated_text: str) -> str:
+    """Keep short translations literal and clean when source is short/plain."""
+    source_tokens = source_text.strip().split()
+    candidate = translated_text.strip()
+    source_lower = source_text.strip().lower()
+    candidate_lower = candidate.lower()
+
+    # Prefer literal greeting equivalents instead of casual paraphrases.
+    if source_lower == "hallo" and candidate_lower in {"hi", "hey"}:
+        candidate = "Hello"
+    elif source_lower == "hello" and candidate_lower in {"hi", "hey"}:
+        candidate = "Hallo"
+
+    # If user did not include emoji, do not add emoji for single-word translation.
+    if len(source_tokens) <= 2 and not has_emoji(source_text):
+        candidate = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", candidate).strip()
+
+    # Trim noisy trailing punctuation for short plain outputs.
+    if len(source_tokens) <= 2:
+        candidate = re.sub(r"[.!?]+$", "", candidate).strip()
+
+    return candidate
+
+
+def exact_single_word_override(text: str, target_language: str, direction: str) -> str:
+    """Return deterministic single-word translation for known pairs, else empty string."""
+    words = text.strip().split()
+    if len(words) != 1:
+        return ""
+
+    key = words[0].lower()
+    lang_rules = EXACT_SINGLE_WORD_OVERRIDES.get(target_language.lower(), {})
+    direction_rules = lang_rules.get("en_to_target" if direction == "EN" else "target_to_en", {})
+    return direction_rules.get(key, "")
+
+
+def is_plausible_translation(source_text: str, translated_text: str) -> bool:
+    """Reject obvious non-translation chatter from small models."""
+    if not translated_text:
+        return False
+
+    lowered = translated_text.lower()
+    if re.search(r"\b(very nice|sure|here you go|translation)\b", lowered):
+        return False
+
+    # For one-word input, a long sentence is usually model drift.
+    source_tokens = source_text.strip().split()
+    translated_tokens = translated_text.strip().split()
+    if len(source_tokens) == 1 and len(translated_tokens) > 3:
+        return False
+
+    # Keep single-word outputs mostly literal and compact.
+    if len(source_tokens) == 1 and has_emoji(translated_text) and not has_emoji(source_text):
+        return False
+
+    return True
+
+
+def clear_status_line():
+    """Clear spinner/status text so the next print does not leave artifacts."""
+    width = shutil.get_terminal_size(fallback=(100, 20)).columns
+    print("\r" + (" " * max(10, width - 1)) + "\r", end="")
+
+
+def call_ollama(messages, num_predict: int = 80) -> str:
     payload = {
         "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
+        "messages": messages,
         "stream": False,
         "options": {
-            "temperature": 0
+            "temperature": 0,
+            "num_predict": num_predict
         }
     }
 
@@ -115,6 +194,82 @@ def translate(text: str, system_prompt: str) -> str:
     except FileNotFoundError:
         print("❌ curl not found. Make sure curl is installed.")
         sys.exit(1)
+
+    return ""
+
+
+def detect_input_language(text: str, target_language: str) -> str:
+    """Return EN, TARGET, or OTHER."""
+    detector_prompt = (
+        "Classify the input language and output exactly one token: EN, TARGET, or OTHER.\n"
+        "EN means the text is English.\n"
+        f"TARGET means the text is {target_language}.\n"
+        "OTHER means it is neither English nor target.\n"
+        "Output one token only."
+    )
+
+    raw = call_ollama(
+        [
+            {"role": "system", "content": detector_prompt},
+            {"role": "user", "content": text}
+        ],
+        num_predict=6
+    ).strip().lower()
+
+    if raw in {"en", "english"}:
+        return "EN"
+    if raw in {"target", target_language.lower()}:
+        return "TARGET"
+    if raw in {"other", "neither", "unknown"}:
+        return "OTHER"
+
+    # Lightweight fallback heuristics for common cases.
+    lowered = text.lower()
+    if re.search(r"\b(the|and|is|are|you|hello|thanks|please)\b", lowered):
+        return "EN"
+    if target_language.lower() == "german" and re.search(r"[äöüß]|\b(und|ist|du|hallo|danke|sch[oö]n|sehr)\b", lowered):
+        return "TARGET"
+    return "OTHER"
+
+
+def translate(text: str, target_language: str) -> str:
+    direction = detect_input_language(text, target_language)
+    if direction == "OTHER":
+        return f"Couldn't detect English or {target_language}."
+
+    if USE_EXACT_SINGLE_WORD_OVERRIDES:
+        exact = exact_single_word_override(text, target_language, direction)
+        if exact:
+            return exact
+
+    if direction == "EN":
+        source_language = "English"
+        destination_language = target_language
+    else:
+        source_language = target_language
+        destination_language = "English"
+
+    system_prompt = build_translation_prompt(target_language, source_language, destination_language)
+    strict_user_prompt = (
+        f"Translate this from {source_language} to {destination_language}. "
+        "Output only the translation text. No labels, no explanations.\n"
+        f"Text: {text}"
+    )
+
+    for attempt in range(2):
+        user_content = text if attempt == 0 else strict_user_prompt
+        candidate = call_ollama(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            num_predict=80
+        )
+        candidate = normalize_short_translation(text, candidate)
+        if is_plausible_translation(text, candidate) or attempt == 1:
+            return candidate
+
+    return text
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -148,7 +303,6 @@ def main():
     print()
 
     target_language = prompt_for_language()
-    system_prompt = build_system_prompt(target_language)
 
     print(f"\n   Translating English ↔ {target_language}")
     print("   Type your message and press Enter. Ctrl+C to quit.\n")
@@ -160,7 +314,8 @@ def main():
                 continue
 
             print("⏳ Translating...", end="\r")
-            translation = translate(user_input, system_prompt)
+            translation = translate(user_input, target_language)
+            clear_status_line()
 
             print(f"✅ {translation}")
 
