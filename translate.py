@@ -8,10 +8,13 @@ Usage: python translate.py
 import subprocess
 import sys
 import json
-import io
+import re
 
-# Force UTF-8 output so emoji and special characters render correctly
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Windows: set console to UTF-8 so accented chars and foreign scripts render correctly
+if sys.platform == "win32":
+    subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
 
 OLLAMA_MODEL = "llama3.2:3b"  # Change to whichever model you have
