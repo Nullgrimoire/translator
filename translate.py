@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""
-translate.py — Multilingual English <-> Any Language translator
-Uses your local Ollama setup. Pick your target language at startup.
-Usage: python translate.py
+"""Terminal translator for casual English <-> target language chat using Ollama.
+
+This script is designed for day-to-day texting support:
+- choose a target language at startup
+- auto-detect whether each message is English or target language
+- translate in the opposite direction
+- copy translated output to clipboard
 """
 
-import subprocess
-import sys
+from __future__ import annotations
+
+import argparse
 import json
 import re
 import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-# Windows: set console to UTF-8 so accented chars and foreign scripts render correctly
-if sys.platform == "win32":
-    # chcp is a shell built-in on Windows, so run it through cmd.
-    subprocess.run("chcp 65001 >NUL", shell=True, check=False)
-    stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
-    stdin_reconfigure = getattr(sys.stdin, "reconfigure", None)
-    stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
-    if callable(stdout_reconfigure):
-        stdout_reconfigure(encoding="utf-8", errors="replace")
-    if callable(stdin_reconfigure):
-        stdin_reconfigure(encoding="utf-8", errors="replace")
-    if callable(stderr_reconfigure):
-        stderr_reconfigure(encoding="utf-8", errors="replace")
+APP_NAME = "Multilingual Translator"
+DEFAULT_MODEL = "llama3.2:3b"
+DEFAULT_LANGUAGE = "Spanish"
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 
-
-OLLAMA_MODEL = "llama3.2:3b"  # Change to whichever model you have
+STYLE_CASUAL = "casual"
+STYLE_EXACT = "exact"
 
 LANGUAGE_ALIASES = {
     "spanish": "Spanish", "espanol": "Spanish", "español": "Spanish", "es": "Spanish",
@@ -34,7 +35,7 @@ LANGUAGE_ALIASES = {
     "german": "German", "deutsch": "German", "de": "German",
     "italian": "Italian", "italiano": "Italian", "it": "Italian",
     "portuguese": "Portuguese", "portugues": "Portuguese", "português": "Portuguese", "pt": "Portuguese",
-    "japanese": "Japanese", "jp": "Japanese", "ja": "Japanese",
+    "japanese": "Japanese", "ja": "Japanese", "jp": "Japanese",
     "korean": "Korean", "ko": "Korean", "kr": "Korean",
     "chinese": "Chinese", "mandarin": "Chinese", "zh": "Chinese",
     "arabic": "Arabic", "ar": "Arabic",
@@ -45,202 +46,176 @@ LANGUAGE_ALIASES = {
     "turkish": "Turkish", "tr": "Turkish",
     "swedish": "Swedish", "sv": "Swedish",
     "greek": "Greek", "el": "Greek",
+    "ukrainian": "Ukrainian", "uk": "Ukrainian",
+    "romanian": "Romanian", "ro": "Romanian",
+    "czech": "Czech", "cs": "Czech",
+    "hungarian": "Hungarian", "hu": "Hungarian",
+    "indonesian": "Indonesian", "id": "Indonesian",
+    "vietnamese": "Vietnamese", "vi": "Vietnamese",
+    "thai": "Thai", "th": "Thai",
+    "hebrew": "Hebrew", "he": "Hebrew",
 }
 
-DEFAULT_LANGUAGE = "Spanish"
-USE_EXACT_SINGLE_WORD_OVERRIDES = False
 
-EXACT_SINGLE_WORD_OVERRIDES = {
-    "german": {
-        "en_to_target": {
-            "hello": "Hallo",
-            "hi": "Hallo",
-        },
-        "target_to_en": {
-            "hallo": "Hello",
-        },
-    }
-}
+@dataclass(frozen=True)
+class AppConfig:
+    model: str
+    style: str
+    timeout_seconds: int
+
+
+def ensure_windows_utf8() -> None:
+    """Set UTF-8 console behavior on Windows terminals."""
+    if sys.platform != "win32":
+        return
+
+    subprocess.run("chcp 65001 >NUL", shell=True, check=False)
+
+    for stream in (sys.stdout, sys.stdin, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def resolve_language(raw: str) -> str:
-    """Normalize user input to a proper language name."""
+    """Normalize user language input to a display name."""
     key = raw.strip().lower().replace("-", "").replace("_", "")
+    if not key:
+        return DEFAULT_LANGUAGE
     return LANGUAGE_ALIASES.get(key, raw.strip().title())
 
 
-def build_translation_prompt(target_language: str, source_language: str, destination_language: str) -> str:
-    return f"""You are a translation engine.
-
-- Translate from {source_language} to {destination_language} only.
-- Keep it casual, like texting a friend. Match the energy, slang, and emoji of the original.
-- Single words are valid input. Keep output short and natural for texting.
-- Output exactly one line. Do not add labels like "Translation:" or quote marks.
-- Never explain, never add context, never respond conversationally. Output only the translated text."""
+def clear_status_line() -> None:
+    """Clear transient status text before printing final output."""
+    width = shutil.get_terminal_size(fallback=(100, 20)).columns
+    print("\r" + (" " * max(8, width - 1)) + "\r", end="")
 
 
-def sanitize_translation(text: str) -> str:
-    """Keep only the translated line if the model adds wrappers or labels."""
+def sanitize_output(text: str) -> str:
+    """Trim common model wrappers to keep a clean single-line translation."""
     cleaned = text.strip().strip('"').strip("'")
-
-    # Keep the first non-empty line to avoid extra explanations.
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     cleaned = lines[0] if lines else cleaned
-
-    # Remove common prefixes some models add.
-    cleaned = re.sub(r"^(translation|translated text|english|german|spanish|french)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"^(translation|translated text|english|german|spanish|french)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     return cleaned.strip()
 
 
-def has_emoji(text: str) -> bool:
-    """Basic emoji detector for common Unicode emoji blocks."""
-    return bool(re.search(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", text))
-
-
-def normalize_short_translation(source_text: str, translated_text: str) -> str:
-    """Keep short translations literal and clean when source is short/plain."""
-    source_tokens = source_text.strip().split()
-    candidate = translated_text.strip()
-    source_lower = source_text.strip().lower()
-    candidate_lower = candidate.lower()
-
-    # Prefer literal greeting equivalents instead of casual paraphrases.
-    if source_lower == "hallo" and candidate_lower in {"hi", "hey"}:
-        candidate = "Hello"
-    elif source_lower == "hello" and candidate_lower in {"hi", "hey"}:
-        candidate = "Hallo"
-
-    # If user did not include emoji, do not add emoji for single-word translation.
-    if len(source_tokens) <= 2 and not has_emoji(source_text):
-        candidate = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", candidate).strip()
-
-    # Trim noisy trailing punctuation for short plain outputs.
-    if len(source_tokens) <= 2:
-        candidate = re.sub(r"[.!?]+$", "", candidate).strip()
-
-    return candidate
-
-
-def exact_single_word_override(text: str, target_language: str, direction: str) -> str:
-    """Return deterministic single-word translation for known pairs, else empty string."""
-    words = text.strip().split()
-    if len(words) != 1:
-        return ""
-
-    key = words[0].lower()
-    lang_rules = EXACT_SINGLE_WORD_OVERRIDES.get(target_language.lower(), {})
-    direction_rules = lang_rules.get("en_to_target" if direction == "EN" else "target_to_en", {})
-    return direction_rules.get(key, "")
-
-
-def is_plausible_translation(source_text: str, translated_text: str) -> bool:
-    """Reject obvious non-translation chatter from small models."""
+def looks_noisy_translation(source_text: str, translated_text: str) -> bool:
+    """Basic guardrail for obvious non-translation chatter."""
     if not translated_text:
-        return False
+        return True
 
-    lowered = translated_text.lower()
-    if re.search(r"\b(very nice|sure|here you go|translation)\b", lowered):
-        return False
+    if re.search(r"\b(sure|here you go|translation|as an ai)\b", translated_text, re.IGNORECASE):
+        return True
 
-    # For one-word input, a long sentence is usually model drift.
-    source_tokens = source_text.strip().split()
-    translated_tokens = translated_text.strip().split()
-    if len(source_tokens) == 1 and len(translated_tokens) > 3:
-        return False
+    source_words = source_text.strip().split()
+    translated_words = translated_text.strip().split()
+    if len(source_words) == 1 and len(translated_words) > 4:
+        return True
 
-    # Keep single-word outputs mostly literal and compact.
-    if len(source_tokens) == 1 and has_emoji(translated_text) and not has_emoji(source_text):
-        return False
-
-    return True
+    return False
 
 
-def clear_status_line():
-    """Clear spinner/status text so the next print does not leave artifacts."""
-    width = shutil.get_terminal_size(fallback=(100, 20)).columns
-    print("\r" + (" " * max(10, width - 1)) + "\r", end="")
-
-
-def call_ollama(messages, num_predict: int = 80) -> str:
-    payload = {
-        "model": OLLAMA_MODEL,
+def post_ollama_chat(
+    model: str,
+    messages: list[dict[str, str]],
+    timeout_seconds: int,
+    num_predict: int,
+) -> str:
+    """Call Ollama chat endpoint and return message content."""
+    payload: dict[str, Any] = {
+        "model": model,
         "messages": messages,
         "stream": False,
         "options": {
             "temperature": 0,
-            "num_predict": num_predict
-        }
+            "num_predict": num_predict,
+        },
     }
 
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "-X", "POST",
-             "http://localhost:11434/api/chat",
-             "-H", "Content-Type: application/json",
-             "-d", json.dumps(payload)],
-            capture_output=True, timeout=30
-        )
-        stdout_text = result.stdout.decode("utf-8", errors="replace")
-        response = json.loads(stdout_text)
-        return sanitize_translation(response["message"]["content"])
-    except subprocess.TimeoutExpired:
-        print("❌ Ollama timed out. Is it running? Try: ollama serve")
-        sys.exit(1)
-    except (json.JSONDecodeError, KeyError):
-        raw = result.stdout.decode("utf-8", errors="replace") if "result" in locals() else ""
-        print("❌ Unexpected response from Ollama.")
-        print("Raw output:", raw[:300])
-        sys.exit(1)
-    except FileNotFoundError:
-        print("❌ curl not found. Make sure curl is installed.")
-        sys.exit(1)
-
-    return ""
-
-
-def detect_input_language(text: str, target_language: str) -> str:
-    """Return EN, TARGET, or OTHER."""
-    detector_prompt = (
-        "Classify the input language and output exactly one token: EN, TARGET, or OTHER.\n"
-        "EN means the text is English.\n"
-        f"TARGET means the text is {target_language}.\n"
-        "OTHER means it is neither English nor target.\n"
-        "Output one token only."
+    body = json.dumps(payload).encode("utf-8")
+    req = Request(
+        OLLAMA_CHAT_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
 
-    raw = call_ollama(
-        [
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        print(f"Error: Ollama HTTP {exc.code}: {exc.reason}")
+        sys.exit(1)
+    except URLError:
+        print("Error: Could not connect to Ollama. Is it running at http://localhost:11434?")
+        sys.exit(1)
+    except TimeoutError:
+        print("Error: Ollama request timed out.")
+        sys.exit(1)
+
+    try:
+        data = json.loads(raw)
+        return sanitize_output(data["message"]["content"])
+    except (json.JSONDecodeError, KeyError):
+        print("Error: Unexpected response from Ollama.")
+        print("Raw output:", raw[:300])
+        sys.exit(1)
+
+
+def build_translation_prompt(source_language: str, destination_language: str, style: str) -> str:
+    """Build system prompt for translation style."""
+    style_line = (
+        "Keep the tone casual and natural for texting. Match slang and emoji from input."
+        if style == STYLE_CASUAL
+        else "Use direct, literal wording. Prefer dictionary-style translation."
+    )
+    return (
+        "You are a translation engine.\n"
+        f"Translate from {source_language} to {destination_language} only.\n"
+        f"{style_line}\n"
+        "Output exactly one line. No labels, no explanations, no quotes."
+    )
+
+
+def detect_input_direction(text: str, target_language: str, config: AppConfig) -> str:
+    """Return EN, TARGET, or OTHER."""
+    detector_prompt = (
+        "Classify the input language and output one token only: EN, TARGET, or OTHER.\n"
+        "EN: input is English.\n"
+        f"TARGET: input is {target_language}.\n"
+        "OTHER: input is neither."
+    )
+
+    result = post_ollama_chat(
+        model=config.model,
+        messages=[
             {"role": "system", "content": detector_prompt},
-            {"role": "user", "content": text}
+            {"role": "user", "content": text},
         ],
-        num_predict=6
+        timeout_seconds=config.timeout_seconds,
+        num_predict=6,
     ).strip().lower()
 
-    if raw in {"en", "english"}:
+    if result in {"en", "english"}:
         return "EN"
-    if raw in {"target", target_language.lower()}:
+    if result in {"target", target_language.lower()}:
         return "TARGET"
-    if raw in {"other", "neither", "unknown"}:
+    if result in {"other", "unknown", "neither"}:
         return "OTHER"
-
-    # Lightweight fallback heuristics for common cases.
-    lowered = text.lower()
-    if re.search(r"\b(the|and|is|are|you|hello|thanks|please)\b", lowered):
-        return "EN"
-    if target_language.lower() == "german" and re.search(r"[äöüß]|\b(und|ist|du|hallo|danke|sch[oö]n|sehr)\b", lowered):
-        return "TARGET"
     return "OTHER"
 
 
-def translate(text: str, target_language: str) -> str:
-    direction = detect_input_language(text, target_language)
+def translate_message(text: str, target_language: str, config: AppConfig) -> str:
+    """Translate text bidirectionally between English and target language."""
+    direction = detect_input_direction(text, target_language, config)
     if direction == "OTHER":
         return f"Couldn't detect English or {target_language}."
-
-    if USE_EXACT_SINGLE_WORD_OVERRIDES:
-        exact = exact_single_word_override(text, target_language, direction)
-        if exact:
-            return exact
 
     if direction == "EN":
         source_language = "English"
@@ -249,63 +224,86 @@ def translate(text: str, target_language: str) -> str:
         source_language = target_language
         destination_language = "English"
 
-    system_prompt = build_translation_prompt(target_language, source_language, destination_language)
-    strict_user_prompt = (
-        f"Translate this from {source_language} to {destination_language}. "
-        "Output only the translation text. No labels, no explanations.\n"
-        f"Text: {text}"
+    prompt = build_translation_prompt(source_language, destination_language, config.style)
+    strict_retry_user_message = (
+        f"Translate from {source_language} to {destination_language}. "
+        "Output only translation text."
+        f"\nText: {text}"
     )
 
     for attempt in range(2):
-        user_content = text if attempt == 0 else strict_user_prompt
-        candidate = call_ollama(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
+        user_content = text if attempt == 0 else strict_retry_user_message
+        output = post_ollama_chat(
+            model=config.model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content},
             ],
-            num_predict=80
+            timeout_seconds=config.timeout_seconds,
+            num_predict=80,
         )
-        candidate = normalize_short_translation(text, candidate)
-        if is_plausible_translation(text, candidate) or attempt == 1:
-            return candidate
+        if not looks_noisy_translation(text, output) or attempt == 1:
+            return output
 
     return text
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """Try to copy to clipboard (Windows/macOS/Linux)."""
+    """Copy translated text to clipboard on Windows/macOS/Linux."""
     try:
         if sys.platform == "win32":
             subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True)
         elif sys.platform == "darwin":
-            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
         else:
-            subprocess.run(["xclip", "-selection", "clipboard"],
-                           input=text.encode(), check=True)
+            subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
 
-def prompt_for_language() -> str:
-    """Ask user which language to translate to/from at startup."""
-    print(f"  Target language (default: {DEFAULT_LANGUAGE}): ", end="")
+def prompt_for_language(default_language: str) -> str:
+    """Interactive prompt for target language selection."""
+    print(f"Target language (default: {default_language}): ", end="")
     raw = input().strip()
-    if not raw:
-        return DEFAULT_LANGUAGE
-    resolved = resolve_language(raw)
-    return resolved
+    return resolve_language(raw) if raw else default_language
 
 
-def main():
-    print("🌎 Multilingual Translator — English ↔ Any Language")
-    print(f"   Model: {OLLAMA_MODEL}")
+def parse_args() -> argparse.Namespace:
+    """Parse command-line options."""
+    parser = argparse.ArgumentParser(description="English <-> Any Language translator powered by Ollama")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model name (default: {DEFAULT_MODEL})")
+    parser.add_argument(
+        "--style",
+        choices=[STYLE_CASUAL, STYLE_EXACT],
+        default=STYLE_CASUAL,
+        help="Translation style (default: casual)",
+    )
+    parser.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds (default: 30)")
+    parser.add_argument(
+        "--default-language",
+        default=DEFAULT_LANGUAGE,
+        help=f"Default target language shown in prompt (default: {DEFAULT_LANGUAGE})",
+    )
+    return parser.parse_args()
+
+
+def run() -> int:
+    """Application entrypoint."""
+    ensure_windows_utf8()
+    args = parse_args()
+
+    config = AppConfig(model=args.model, style=args.style, timeout_seconds=max(5, args.timeout))
+
+    print(f"{APP_NAME} - English <-> Any Language")
+    print(f"Model: {config.model}")
+    print(f"Style: {config.style}")
     print()
 
-    target_language = prompt_for_language()
+    target_language = prompt_for_language(resolve_language(args.default_language))
 
-    print(f"\n   Translating English ↔ {target_language}")
-    print("   Type your message and press Enter. Ctrl+C to quit.\n")
+    print(f"\nTranslating English <-> {target_language}")
+    print("Type your message and press Enter. Ctrl+C to quit.\n")
 
     while True:
         try:
@@ -313,22 +311,19 @@ def main():
             if not user_input:
                 continue
 
-            print("⏳ Translating...", end="\r")
-            translation = translate(user_input, target_language)
+            print("Translating...", end="\r")
+            translation = translate_message(user_input, target_language, config)
             clear_status_line()
+            print(f"Translated: {translation}")
 
-            print(f"✅ {translation}")
-
-            copied = copy_to_clipboard(translation)
-            if copied:
-                print("   (copied to clipboard)\n")
+            if copy_to_clipboard(translation):
+                print("(copied to clipboard)\n")
             else:
                 print()
-
         except KeyboardInterrupt:
-            print("\n\nBye!")
-            break
+            print("\nBye!")
+            return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run())
