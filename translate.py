@@ -12,9 +12,17 @@ import re
 
 # Windows: set console to UTF-8 so accented chars and foreign scripts render correctly
 if sys.platform == "win32":
-    subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    # chcp is a shell built-in on Windows, so run it through cmd.
+    subprocess.run("chcp 65001 >NUL", shell=True, check=False)
+    stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+    stdin_reconfigure = getattr(sys.stdin, "reconfigure", None)
+    stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(stdout_reconfigure):
+        stdout_reconfigure(encoding="utf-8", errors="replace")
+    if callable(stdin_reconfigure):
+        stdin_reconfigure(encoding="utf-8", errors="replace")
+    if callable(stderr_reconfigure):
+        stderr_reconfigure(encoding="utf-8", errors="replace")
 
 
 OLLAMA_MODEL = "llama3.2:3b"  # Change to whichever model you have
@@ -55,7 +63,21 @@ def build_system_prompt(target_language: str) -> str:
 - If the input is in neither, output only: "Couldn't detect English or {target_language}."
 - Keep it casual, like texting a friend. Match the energy, slang, and emoji of the original.
 - Single words are valid input — translate them directly with no extra output. "Hello" in English becomes "Hallo" in German, nothing else.
+- Output exactly one line. Do not add labels like "Translation:" or quote marks.
 - Never explain, never add context, never respond conversationally. Output only the translated text."""
+
+
+def sanitize_translation(text: str) -> str:
+    """Keep only the translated line if the model adds wrappers or labels."""
+    cleaned = text.strip().strip('"').strip("'")
+
+    # Keep the first non-empty line to avoid extra explanations.
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    cleaned = lines[0] if lines else cleaned
+
+    # Remove common prefixes some models add.
+    cleaned = re.sub(r"^(translation|translated text|english|german|spanish|french)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 def translate(text: str, system_prompt: str) -> str:
@@ -65,7 +87,10 @@ def translate(text: str, system_prompt: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text}
         ],
-        "stream": False
+        "stream": False,
+        "options": {
+            "temperature": 0
+        }
     }
 
     try:
@@ -74,16 +99,18 @@ def translate(text: str, system_prompt: str) -> str:
              "http://localhost:11434/api/chat",
              "-H", "Content-Type: application/json",
              "-d", json.dumps(payload)],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, timeout=30
         )
-        response = json.loads(result.stdout)
-        return response["message"]["content"].strip()
+        stdout_text = result.stdout.decode("utf-8", errors="replace")
+        response = json.loads(stdout_text)
+        return sanitize_translation(response["message"]["content"])
     except subprocess.TimeoutExpired:
         print("❌ Ollama timed out. Is it running? Try: ollama serve")
         sys.exit(1)
     except (json.JSONDecodeError, KeyError):
+        raw = result.stdout.decode("utf-8", errors="replace") if "result" in locals() else ""
         print("❌ Unexpected response from Ollama.")
-        print("Raw output:", result.stdout[:300])
+        print("Raw output:", raw[:300])
         sys.exit(1)
     except FileNotFoundError:
         print("❌ curl not found. Make sure curl is installed.")
